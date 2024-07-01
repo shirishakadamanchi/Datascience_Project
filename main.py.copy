@@ -1,0 +1,188 @@
+import os
+import warnings; warnings.filterwarnings("ignore")
+import torch
+from langchain.llms import HuggingFacePipeline
+import transformers
+from transformers import StoppingCriteria, StoppingCriteriaList
+from langchain.document_loaders import WebBaseLoader
+
+import pickle
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQAWithSourcesChain
+from langchain.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import time
+from torch import cuda, bfloat16
+from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+
+from dotenv import load_dotenv
+load_dotenv()  # take environment variables from .env (especially openai api key)
+
+model_name = os.environ["model_id"]
+hf_auth = os.environ["hf_auth"]
+
+@st.cache_resource
+class ModelLoader:
+    """
+    Model loading class for both model_id and model tokenizer
+    """
+    def __init__(self, model_id, hf_auth):
+        self.model_id = model_id
+        self.hf_auth = hf_auth
+        self.device = f'cuda:{cuda.current_device()}' if cuda.is_available() else 'cpu'
+        self.model = self.initialize_model()
+        self.tokenizer = self.load_tokenizer()
+
+    def initialize_model(self):
+        # Set quantization configuration
+        bnb_config = transformers.BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type='nf4',
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype='bfloat16'
+        )
+
+        # Initialize and load the model
+        model_config = AutoConfig.from_pretrained(
+            self.model_id,
+            use_auth_token=self.hf_auth,
+            cache_dir='./model/'
+        )
+
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            cache_dir='./model/',
+            trust_remote_code=True,
+            config=model_config,
+            quantization_config=bnb_config,
+            device_map='auto',
+            use_auth_token=self.hf_auth  
+        )
+
+        # Enable evaluation mode
+        model.eval()
+
+        return model
+    
+
+    def load_tokenizer(self):
+        # Initialize and load the tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id,
+            use_auth_token=self.hf_auth
+        )
+        return tokenizer
+# loading the model
+model_var = ModelLoader(model_id=model_name, hf_auth=hf_auth)
+tokenizer = model_var.tokenizer
+model = model_var.model
+device = model_var.device
+
+
+# creating chunks
+stop_list = ['\nHuman:', '\n```\n']
+stop_token_ids = [tokenizer(x)['input_ids'] for x in stop_list]
+stop_token_ids = [torch.LongTensor(x).to(device) for x in stop_token_ids]
+# define custom stopping criteria object
+class StopOnTokens(StoppingCriteria):
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+
+        for stop_ids in stop_token_ids:
+            if torch.eq(input_ids[0][-len(stop_ids):], stop_ids).all():
+                return True
+        return False
+
+stopping_criteria = StoppingCriteriaList([StopOnTokens()])
+
+generate_text = transformers.pipeline(
+    model=model,
+    tokenizer=tokenizer,
+    return_full_text=True,  # langchain expects the full text
+    task='text-generation',
+    # we pass model parameters here too
+    stopping_criteria=stopping_criteria,  # without this model rambles during chat
+    temperature=0.1,  # 'randomness' of outputs, 0.0 is the min and 1.0 the max
+    max_new_tokens=512,  # max number of tokens to generate in the output
+    repetition_penalty=1.1  # without this output begins repeating
+)
+llm = HuggingFacePipeline(pipeline=generate_text)
+
+
+## stream lit application
+st.title("Mavericks Catch and consume")
+st.sidebar.title("Store URLs")
+
+urls = []
+for i in range(3):
+    if i == 0:
+        url = st.sidebar.text_input(f"Steam")
+    elif i == 1:
+        url = st.sidebar.text_input(f"Xbox")
+    elif i == 2:
+        url = st.sidebar.text_input(f"Playstation")
+    if url != '':
+        urls.append(url)
+
+process_url_clicked = st.sidebar.button("Process URLs")
+file_path = "faiss_store_openai.pkl"
+
+main_placeholder = st.empty()
+# llm = OpenAI(temperature=0.9, max_tokens=500)
+
+
+
+if process_url_clicked:
+    # load data
+    loader = WebBaseLoader(urls)
+    main_placeholder.text("Data Loading...Started...✅✅✅")
+    data = loader.load()
+    # split data, Keeping separator as """\n\n\n"""
+    text_splitter = RecursiveCharacterTextSplitter(
+        separators=['\n\n', '.', ',', "\n"],
+        chunk_size=500, chunk_overlap = 50
+    )
+    
+    embedding_model_name = "sentence-transformers/all-mpnet-base-v2"
+    embedding_model_kwargs = {"device": "cuda"}
+    main_placeholder.text("Text Splitter...Started...✅✅✅")
+    docs = text_splitter.split_documents(data)
+    # create embeddings and save it to FAISS index
+    embeddings = HuggingFaceEmbeddings(model_name= embedding_model_name, model_kwargs=embedding_model_kwargs)
+    transformers_vectorstore = FAISS.from_documents(docs, embeddings)
+    main_placeholder.text("Embedding Vector Started Building...✅✅✅")
+    time.sleep(2)
+
+    # Save the FAISS index to a pickle file
+    with open(file_path, "wb") as f:
+        pickle.dump(transformers_vectorstore, f)
+    main_placeholder.text("Ready for some fun?")
+
+    df = pd.DataFrame(np.random.randn(50, 2), columns=("datapoints", "Information"))
+    st.write(df)
+
+# query = main_placeholder.text_input("Question: ")
+# if query:
+#     if os.path.exists(file_path):
+#         with open(file_path, "rb") as f:
+#             vectorstore = pickle.load(f)
+#             chain = RetrievalQAWithSourcesChain.from_llm(llm=llm, retriever=vectorstore.as_retriever())
+#             result = chain({"question": query}, return_only_outputs=True)
+#             # result will be a dictionary of this format --> {"answer": "", "sources": [] }
+#             st.header("Answer")
+#             st.write(result["answer"])
+            
+#             df = pd.DataFrame(np.random.randn(50, 2), columns=("datapoints", "Information"))
+
+#             st.write(df)
+#             # # Display sources, if available
+#             # sources = result.get("sources", "")
+#             # if sources:
+#             #     st.subheader("Sources:")
+#             #     sources_list = sources.split("\n")  # Split the sources by newline
+#             #     for source in sources_list:
+#             #         st.write(source)
+

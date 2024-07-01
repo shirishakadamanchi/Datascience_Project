@@ -1,0 +1,16 @@
+transformers==4.36.2
+accelerate==0.26.1
+einops==0.7.0
+langchain==0.1.1
+xformers==0.0.23.post1
+bitsandbytes==0.40.2
+faiss-gpu==1.7.2
+sentence_transformers==2.2.2
+python-dotenv==1.0.0
+streamlit==1.22.0
+pandas==2.2.0
+beautifulsoup4==4.12.3
+langdetect
+boto3
+pdfkit
+pypdf
